@@ -488,8 +488,7 @@ if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1 &&
     fi
 
     # `--all-targets` so test modules are linted too; they are where most of this crate lives.
-    # `--no-deps` keeps the sibling crates that .cargo/config.toml redirects to local working
-    # copies out of the report - their warnings are real, but they are not this commit's to fix.
+    # `--no-deps` limits diagnostics to this crate; dependency warnings are not this commit's to fix.
     if ! clippy_output=$(cargo clippy --all-targets --no-deps --quiet -- -D warnings 2>&1); then
         # A lint carries a `-->` source location; a cargo that could not run at all - an
         # unresolvable dependency, no network, a poisoned lock - carries none. The two need
