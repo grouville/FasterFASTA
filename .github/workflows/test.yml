@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+    branches: [main, main-dev]
+  pull_request:
+    branches: [main, main-dev]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --no-deps -- -D warnings
