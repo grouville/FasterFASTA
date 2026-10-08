@@ -54,7 +54,7 @@ Small, exact, and unlikely to be your bottleneck, but here so a pipeline need no
 ## Installation
 
 ```bash
-cargo install --git https://github.com/unum-bio/FasterFASTA    # install from GitHub
+cargo install --git https://github.com/unum-science/FasterFASTA    # install from GitHub
 cargo install --path . --force                                 # or install from local clone
 ```
 
