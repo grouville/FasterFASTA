@@ -470,8 +470,6 @@ mod tests {
         assert_eq!(fraction.retained, 100);
     }
 
-    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
-    /// by letter. `-h` and `-V` are clap's own and stay.
     #[test]
     fn output_alias_is_rejected_before_truncating_the_input() {
         let directory = tempfile::tempdir().unwrap();
@@ -483,6 +481,8 @@ mod tests {
         assert_eq!(std::fs::read(&input).unwrap(), b">a\nACGT\n");
     }
 
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
     #[test]
     fn declares_no_short_flags() {
         // Built first, because `-h` and `-V` are only added then and they are the exemption.

@@ -14,6 +14,7 @@
 //! Nothing here spawns a thread or picks a range, and nothing here declares a sibling module.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(unix))]
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
@@ -576,65 +577,72 @@ pub enum Destination {
 }
 
 impl Destination {
-    /// Reject destinations that overwrite an input or another output before opening writers.
+    /// Reject input aliases and duplicate outputs before opening writers.
     ///
-    /// File identities catch hard links as well as different spellings and symbolic links.
-    /// Handles are closed after hashing, so validation does not keep one descriptor per input.
+    /// This checks the current paths; concurrent replacements can invalidate the result.
     pub fn validate_inputs(&self, inputs: &[String]) -> io::Result<()> {
-        let outputs = match self {
-            Destination::Stream(Some(path)) if path != "-" => vec![PathBuf::from(path)],
-            Destination::Directory(directory) => {
-                let mut names = HashSet::new();
-                let mut outputs = Vec::with_capacity(inputs.len());
+        let directory = match self {
+            Destination::Stream(Some(path)) if path != "-" => {
+                let output = Path::new(path);
+                let identity = match file_identity(output) {
+                    Ok(identity) => identity,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                };
                 for input in inputs {
-                    let name = named_file(input, self)?;
-                    if !names.insert(name) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "--output-dir would write more than one input to '{}'",
-                                name.display()
-                            ),
-                        ));
+                    if input_matches_output(Path::new(input), output, identity)? {
+                        return Err(output_collision(input, output));
                     }
-                    outputs.push(Path::new(directory).join(name));
                 }
-                outputs
+                return Ok(());
             }
+            Destination::Directory(directory) => directory,
             _ => return Ok(()),
         };
-        let mut sources: HashMap<u64, Vec<&Path>> = HashMap::new();
+        let mut names = HashSet::new();
+        let mut outputs = Vec::new();
+        for input in inputs {
+            let name = named_file(input, self)?;
+            if !names.insert(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--output-dir would write more than one input to '{}'",
+                        name.display()
+                    ),
+                ));
+            }
+            let output = Path::new(directory).join(name);
+            match file_identity(&output) {
+                Ok(identity) => outputs.push((output, identity)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        drop(names);
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        let mut sources: HashMap<FileIdentity, Vec<&Path>> = HashMap::new();
         let mut special_sources = HashSet::new();
-        for input in inputs.iter().filter(|input| input.as_str() != "-") {
+        for input in inputs {
             let path = Path::new(input);
-            if let Some(identity) = regular_file_identity(path)? {
+            if let Some(identity) = file_identity(path)? {
                 sources.entry(identity).or_default().push(path);
             } else {
                 special_sources.insert(path.canonicalize()?);
             }
         }
-        let mut destinations: HashMap<u64, Vec<&Path>> = HashMap::new();
-        for output in &outputs {
-            let identity = match regular_file_identity(output) {
-                Ok(identity) => identity,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
+        let mut destinations: HashMap<FileIdentity, Vec<&Path>> = HashMap::new();
+        for (output, identity) in &outputs {
             if let Some(identity) = identity {
-                for source in sources.get(&identity).into_iter().flatten() {
-                    if same_file::is_same_file(source, output)? {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "output '{}' would overwrite input '{}'; use --in-place",
-                                output.display(),
-                                source.display()
-                            ),
-                        ));
+                for source in sources.get(identity).into_iter().flatten() {
+                    if input_matches_output(source, output, Some(*identity))? {
+                        return Err(output_collision(source.display(), output));
                     }
                 }
-                for earlier in destinations.get(&identity).into_iter().flatten() {
-                    if same_file::is_same_file(earlier, output)? {
+                for earlier in destinations.get(identity).into_iter().flatten() {
+                    if input_matches_output(earlier, output, Some(*identity))? {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             format!(
@@ -645,12 +653,9 @@ impl Destination {
                         ));
                     }
                 }
-                destinations.entry(identity).or_default().push(output);
+                destinations.entry(*identity).or_default().push(output);
             } else if special_sources.contains(&output.canonicalize()?) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("output '{}' refers to an input", output.display()),
-                ));
+                return Err(output_collision("an input", output));
             }
         }
         Ok(())
@@ -725,15 +730,63 @@ impl Destination {
     }
 }
 
-/// A closed-handle fingerprint; matching fingerprints still require exact file comparison.
-fn regular_file_identity(path: &Path) -> io::Result<Option<u64>> {
-    if !path.metadata()?.is_file() {
-        return Ok(None);
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = u64;
+
+fn file_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
+    let metadata = path.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some((metadata.dev(), metadata.ino())))
     }
-    let handle = same_file::Handle::from_path(path)?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    handle.hash(&mut hasher);
-    Ok(Some(hasher.finish()))
+    #[cfg(not(unix))]
+    {
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let handle = same_file::Handle::from_path(path)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        handle.hash(&mut hasher);
+        Ok(Some(hasher.finish()))
+    }
+}
+
+fn input_matches_output(
+    input: &Path,
+    output: &Path,
+    identity: Option<FileIdentity>,
+) -> io::Result<bool> {
+    if input == Path::new("-") {
+        let handle = same_file::Handle::stdin()?;
+        #[cfg(unix)]
+        return Ok(identity == Some((handle.dev(), handle.ino())));
+        #[cfg(not(unix))]
+        return Ok(handle == same_file::Handle::from_path(output)?);
+    }
+    let source = file_identity(input)?;
+    if source != identity {
+        return Ok(false);
+    }
+    if source.is_none() {
+        return Ok(input.canonicalize()? == output.canonicalize()?);
+    }
+    #[cfg(unix)]
+    return Ok(true);
+    #[cfg(not(unix))]
+    same_file::is_same_file(input, output)
+}
+
+fn output_collision(input: impl std::fmt::Display, output: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "output '{}' would overwrite input '{input}'",
+            output.display()
+        ),
+    )
 }
 
 /// The name `input` contributes to its own output, which standard input does not have.
@@ -1764,6 +1817,33 @@ mod tests {
             .validate_inputs(&[first.display().to_string(), later.display().to_string()])
             .is_err());
         assert_eq!(std::fs::read(&later).unwrap(), b">c\nAAAA\n");
+
+        let output = tempfile::tempdir().unwrap();
+        let existing = written(&output, "reads.fa", b"keep");
+        std::fs::hard_link(&existing, output.path().join("later.fa")).unwrap();
+        let destination = Destination::Directory(output.path().display().to_string());
+        assert!(destination
+            .validate_inputs(&[first.display().to_string(), later.display().to_string()])
+            .is_err());
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_accepts_a_write_only_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let input = written(&directory, "reads.fa", b">a\nACGT\n");
+        let output = written(&directory, "output.fa", b"old");
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let destination = Destination::Stream(Some(output.display().to_string()));
+        destination
+            .validate_inputs(&[input.display().to_string()])
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&output)
+            .unwrap();
     }
 
     #[test]
