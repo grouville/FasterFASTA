@@ -13,6 +13,8 @@
 //! Scheduling lives in [`crate::scheduling`].
 //! Nothing here spawns a thread or picks a range, and nothing here declares a sibling module.
 
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -574,6 +576,86 @@ pub enum Destination {
 }
 
 impl Destination {
+    /// Reject destinations that overwrite an input or another output before opening writers.
+    ///
+    /// File identities catch hard links as well as different spellings and symbolic links.
+    /// Handles are closed after hashing, so validation does not keep one descriptor per input.
+    pub fn validate_inputs(&self, inputs: &[String]) -> io::Result<()> {
+        let outputs = match self {
+            Destination::Stream(Some(path)) if path != "-" => vec![PathBuf::from(path)],
+            Destination::Directory(directory) => {
+                let mut names = HashSet::new();
+                let mut outputs = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let name = named_file(input, self)?;
+                    if !names.insert(name) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "--output-dir would write more than one input to '{}'",
+                                name.display()
+                            ),
+                        ));
+                    }
+                    outputs.push(Path::new(directory).join(name));
+                }
+                outputs
+            }
+            _ => return Ok(()),
+        };
+        let mut sources: HashMap<u64, Vec<&Path>> = HashMap::new();
+        let mut special_sources = HashSet::new();
+        for input in inputs.iter().filter(|input| input.as_str() != "-") {
+            let path = Path::new(input);
+            if let Some(identity) = regular_file_identity(path)? {
+                sources.entry(identity).or_default().push(path);
+            } else {
+                special_sources.insert(path.canonicalize()?);
+            }
+        }
+        let mut destinations: HashMap<u64, Vec<&Path>> = HashMap::new();
+        for output in &outputs {
+            let identity = match regular_file_identity(output) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if let Some(identity) = identity {
+                for source in sources.get(&identity).into_iter().flatten() {
+                    if same_file::is_same_file(source, output)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "output '{}' would overwrite input '{}'; use --in-place",
+                                output.display(),
+                                source.display()
+                            ),
+                        ));
+                    }
+                }
+                for earlier in destinations.get(&identity).into_iter().flatten() {
+                    if same_file::is_same_file(earlier, output)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "outputs '{}' and '{}' refer to the same file",
+                                earlier.display(),
+                                output.display()
+                            ),
+                        ));
+                    }
+                }
+                destinations.entry(identity).or_default().push(output);
+            } else if special_sources.contains(&output.canonicalize()?) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("output '{}' refers to an input", output.display()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The path whose terminal-ness decides the default rendering, for [`Presentation`].
     ///
     /// Only a stream can reach a terminal, so every other destination answers as a file
@@ -641,6 +723,17 @@ impl Destination {
             swap_into,
         }))
     }
+}
+
+/// A closed-handle fingerprint; matching fingerprints still require exact file comparison.
+fn regular_file_identity(path: &Path) -> io::Result<Option<u64>> {
+    if !path.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let handle = same_file::Handle::from_path(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    handle.hash(&mut hasher);
+    Ok(Some(hasher.finish()))
 }
 
 /// The name `input` contributes to its own output, which standard input does not have.
@@ -1620,6 +1713,75 @@ mod tests {
         assert!(destination
             .writer_for("./reads.fastq", Rendering::PLAIN)
             .is_err());
+    }
+
+    #[test]
+    fn validation_rejects_input_aliases_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = written(&directory, "reads.fa", b">a\nACGT\n");
+        let hard_link = directory.path().join("hard.fa");
+        std::fs::hard_link(&input, &hard_link).unwrap();
+        let aliases = [
+            input.clone(),
+            directory.path().join(".").join("reads.fa"),
+            hard_link,
+        ];
+        let inputs = vec![input.display().to_string()];
+        for alias in aliases {
+            let destination = Destination::Stream(Some(alias.display().to_string()));
+            assert_eq!(
+                destination.validate_inputs(&inputs).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), b">a\nACGT\n");
+        }
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("symbolic.fa");
+            std::os::unix::fs::symlink(&input, &alias).unwrap();
+            assert!(Destination::Stream(Some(alias.display().to_string()))
+                .validate_inputs(&inputs)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_output_names_and_later_input_aliases() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = written(&first_directory, "reads.fa", b">a\nACGT\n");
+        let second = written(&second_directory, "reads.fa", b">b\nTGCA\n");
+        let output = tempfile::tempdir().unwrap();
+        let destination = Destination::Directory(output.path().display().to_string());
+        assert!(destination
+            .validate_inputs(&[first.display().to_string(), second.display().to_string()])
+            .is_err());
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+
+        let later = written(&second_directory, "later.fa", b">c\nAAAA\n");
+        std::fs::hard_link(&later, output.path().join("reads.fa")).unwrap();
+        assert!(destination
+            .validate_inputs(&[first.display().to_string(), later.display().to_string()])
+            .is_err());
+        assert_eq!(std::fs::read(&later).unwrap(), b">c\nAAAA\n");
+    }
+
+    #[test]
+    fn validation_accepts_distinct_outputs_and_explicit_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = written(&directory, "reads.fa", b">a\nACGT\n");
+        let inputs = vec![input.display().to_string()];
+        for destination in [
+            Destination::Stream(None),
+            Destination::Stream(Some("-".to_string())),
+            Destination::Discard,
+            Destination::InPlace,
+            Destination::Stream(Some(
+                directory.path().join("result.fa").display().to_string(),
+            )),
+        ] {
+            destination.validate_inputs(&inputs).unwrap();
+        }
     }
 
     #[test]
